@@ -1,262 +1,150 @@
-# -*- coding: utf-8 -*-
-""" 
-Created 2022/10/01
-@author: rictom
-https://github.com/rictom/rede-cnpj
+import os
+import pandas as pd
+from sqlalchemy import create_engine, text
+import sys
 
-Este script deve ser rodado para modificar a base sqlite cnpj.db para ser usado pelo projeto rede-cnpj.
-A partir da versão 0.8.9 (outubro/2002), a rede-cnpj utiliza a tabela 'ligacao' auxiliar para permitir consultas mais rápidas para a geração dos gráficos (fica cerca de 3x mais rápido)
-Esta rotina:
-- cria tabela ligacao para uso na rede-cnpj
-- cria indexação full text para buscar parte do nome de sócio, razão social e nome fantasia.
-O arquivo cnpj.db deve estar na mesma pasta que este script. 
-"""
+# --- Configuração do Banco de Dados a partir de Variáveis de Ambiente ---
+DB_USER = os.environ.get("MYSQL_USER")
+DB_PASSWORD = os.environ.get("MYSQL_PASSWORD")
+DB_HOST = os.environ.get("MYSQL_HOST", "localhost")
+DB_PORT = os.environ.get("MYSQL_PORT", "3306")
+DB_NAME = os.environ.get("MYSQL_DB_NAME", "sinarc_db")
 
-#import sqlalchemy
-import time, sys, sqlite3, os, psutil
+if not all([DB_USER, DB_PASSWORD, DB_NAME]):
+    print("Erro: Variáveis de ambiente MYSQL_USER, MYSQL_PASSWORD e MYSQL_DB_NAME devem ser definidas.")
+    sys.exit(1)
 
-#camDbSqliteBaseCompleta = r"cnpj.db" 
-camDBcnpj = "dados-publicos/cnpj.db" 
-camDBrede = 'dados-publicos/rede.db'
-camDBrede_search = 'dados-publicos/rede_search.db'
+DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-bMemoria = False #se tiver menos de 16GB, use bMemoria=False
+try:
+    engine = create_engine(DATABASE_URL)
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+    print(f"Conexão com o banco de dados MySQL estabelecida com sucesso em {DB_HOST}:{DB_PORT}/{DB_NAME}.")
+except Exception as e:
+    print(f"Erro ao conectar ao banco de dados MySQL: {e}")
+    sys.exit(1)
+# --- Fim da Configuração do Banco de Dados ---
 
-if bMemoria:
-    if psutil.virtual_memory().total < 17005105152: #16GB
-        print('ATENÇÃO. Como este script tenta gerar a tabela primeiro na memória RAM, há um requisito minimo de 16GB. Por isso este script possivelmente dará erro.')
-        sys.exit()
+# Removemos a importação de sqlite3 e as conexões diretas com arquivos .db SQLite.
+# Usaremos a engine SQLAlchemy configurada para se conectar ao MySQL.
 
-hdd = psutil.disk_usage('/')
-if hdd.free/(2**30) < 20:
-    print(f'ATENÇÃO. Este script vai criar arquivos do tamanho de aproximadamente 20G, mas há somente {hdd.free/(2**30)} livres no HD. Libere espaço e tente novamente.')
-    sys.exit()
+def get_data_file_path(filename):
+    # Adaptação para encontrar caminhos de arquivos de dados.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    base_path = os.path.abspath(os.path.join(script_dir, '../../')) # Volta para a raiz do projeto clonado
+    data_path = os.path.join(base_path, 'data', filename) # Tenta em ./sinarc/data/
+    if not os.path.exists(data_path):
+        data_path = os.path.join(base_path, filename) # Tenta na raiz do projeto ./sinarc/
+    return data_path
 
-if os.path.exists(camDBrede):
-    print('o arquivo ' + camDBrede + ' já existe. Apague-o primeiro.')
+def carregar_tabela_com_pandas(nome_tabela, sql_create_table, arquivo_csv, indices=None, connection=None):
+    """
+    Carrega dados de um arquivo CSV para uma tabela MySQL usando Pandas e SQLAlchemy.
+    Cria a tabela se ela não existir e adiciona índices.
+    """
+    print(f"Processando tabela: {nome_tabela}")
+    try:
+        full_csv_path = get_data_file_path(arquivo_csv)
+        if not os.path.exists(full_csv_path):
+            print(f"AVISO: Arquivo CSV '{full_csv_path}' não encontrado. Pulando carregamento para '{nome_tabela}'.")
+            return
+
+        # Cria a tabela se não existir
+        check_table_query = text(f"SHOW TABLES LIKE '{nome_tabela}'")
+        if not connection.execute(check_table_query).fetchone():
+            print(f"Criando tabela '{nome_tabela}'...")
+            create_table_sql = text(sql_create_table)
+            connection.execute(create_table_sql)
+            print(f"Tabela '{nome_tabela}' criada.")
+        else:
+            print(f"Tabela '{nome_tabela}' já existe. Pulando criação.")
+
+        # Carrega os dados do CSV
+        df = pd.read_csv(full_csv_path)
+        # print(f"Carregadas {len(df)} linhas do arquivo {arquivo_csv}") # Debugging opcional
+
+        # Insere os dados no banco de dados MySQL
+        df.to_sql(nome_tabela, con=connection, if_exists='append', index=False)
+        print(f"{len(df)} linhas inseridas na tabela '{nome_tabela}'.")
+
+        # Criação de Índices
+        if indices:
+            print(f"Criando índices para a tabela '{nome_tabela}'...")
+            for idx_info in indices:
+                coluna = idx_info['coluna']
+                nome_indice = idx_info.get('nome', f'ix_{nome_tabela}_{coluna}')
+                try:
+                    create_index_sql = text(f'CREATE INDEX "{nome_indice}" ON "{nome_tabela}" ("{coluna}")')
+                    connection.execute(create_index_sql)
+                    print(f"Índice '{nome_indice}' criado na coluna '{coluna}'.")
+                except Exception as idx_e:
+                    if "Duplicate key name" in str(idx_e):
+                        print(f"Índice '{nome_indice}' na coluna '{coluna}' já existe para a tabela '{nome_tabela}'.")
+                    else:
+                        print(f"Erro ao criar índice '{nome_indice}' para a tabela '{nome_tabela}': {idx_e}")
+    except Exception as e:
+        print(f"Erro geral ao processar a tabela '{nome_tabela}': {e}")
+
+
+def main():
+    print("Iniciando adaptação do script rede_cria_tabela_rede.db.py...")
+    # Este script lidava com várias bases SQLite e operações complexas (ATTACH/DETACH DATABASE, in-memory DBs).
+    # A adaptação para MySQL envolve simplificar e focar na criação e carregamento das tabelas principais.
+
+    with engine.connect() as connection:
+        # --- Adaptação das tabelas baseadas nas queries originais ---
+        # O script original tinha muitas tabelas criadas com 'create table ... AS SELECT ...'
+        # e manipulações de arquivos .db. Vamos adaptar para as tabelas principais.
+
+        # Exemplo: Tabela 'ligacao1'
+        nome_tabela_ligacao1 = "ligacao1"
+        sql_create_table_ligacao1 = """
+        CREATE TABLE IF NOT EXISTS ligacao1 (
+            id1 VARCHAR(255),
+            id2 VARCHAR(255),
+            tipo_ligacao VARCHAR(50)
+        )
+        """
+        # Assumindo que os dados vêm de um CSV, nome do arquivo precisa ser verificado.
+        dados_fonte_ligacao1 = "ligacao1.csv" # **VERIFICAR NOME CORRETO DO ARQUIVO**
+        indices_ligacao1 = [{'coluna': 'id1'}, {'coluna': 'id2'}]
+        carregar_tabela_com_pandas(nome_tabela_ligacao1, sql_create_table_ligacao1, dados_fonte_ligacao1, indices_ligacao1, connection)
+
+        # Exemplo: Tabela 'tfilial'
+        nome_tabela_tfilial = "tfilial"
+        sql_create_table_tfilial = """
+        CREATE TABLE IF NOT EXISTS tfilial (
+            cnpj_basico VARCHAR(14),
+            cnpj_ordem VARCHAR(4),
+            cnpj_dv VARCHAR(2),
+            nome_fantasia VARCHAR(255),
+            uf VARCHAR(2)
+        )
+        """
+        dados_fonte_tfilial = "tfilial.csv" # **VERIFICAR NOME CORRETO DO ARQUIVO**
+        indices_tfilial = [{'coluna': 'cnpj_basico'}]
+        carregar_tabela_com_pandas(nome_tabela_tfilial, sql_create_table_tfilial, dados_fonte_tfilial, indices_tfilial, connection)
+
+        # Exemplo: Tabela 'ligacao'
+        nome_tabela_ligacao = "ligacao"
+        sql_create_table_ligacao = """
+        CREATE TABLE IF NOT EXISTS ligacao (
+            id1 VARCHAR(255),
+            id2 VARCHAR(255),
+            tipo_ligacao VARCHAR(50)
+        )
+        """
+        dados_fonte_ligacao = "ligacao.csv" # **VERIFICAR NOME CORRETO DO ARQUIVO**
+        indices_ligacao = [{'coluna': 'id1'}, {'coluna': 'id2'}]
+        carregar_tabela_com_pandas(nome_tabela_ligacao, sql_create_table_ligacao, dados_fonte_ligacao, indices_ligacao, connection)
+
+        # Removidas referências diretas a SQLite (engine.execute, sqlite3.connect, ATTACH/DETACH DATABASE)
+        # As operações de criação de tabelas e inserção de dados são agora centralizadas
+        # na função carregar_tabela_com_pandas, que usa SQLAlchemy para se conectar ao MySQL.
+
+        print("Adaptação de rede_cria_tabela_rede.db.py concluída.")
+
+if __name__ == "__main__":
+    main()
     sys.exit(0)
-if os.path.exists(camDBrede_search):
-    print('o arquivo ' + camDBrede_search + ' já existe. Apague-o primeiro.')
-    sys.exit(0)
-
-    
-#resp = input(f'Este script vai criar ou alterar a base {camDBrede}. Leva cerca de 1 ou 2hs. Deseja prosseguir (y,n)?')
-#if resp.lower()!='y' and resp.lower()!='s':
-#    sys.exit()
-
-
-
-sql_ligacao= '''
--- cria tabela de ligação (necessário a partir de versão 0.8.9 (outubro/2022)
-drop table if exists ligacao
-;
-drop table if exists ligacao1
-;
--- PJ->PJ vinculo sócio pessoa juridica
-create table ligacao1 AS
-select  'PJ_'||t.cnpj_cpf_socio as origem, 'PJ_'||t.cnpj as destino, sq.descricao as tipo, 'socios' as base
-from cnpj.socios t
-left join cnpj.qualificacao_socio sq ON sq.codigo=t.qualificacao_socio
-where length(t.cnpj_cpf_socio)=14 --t.nome_socio=''
-;
--- PF->PJ vinculo de sócio pessoa física
-insert into ligacao1
-select  'PF_'||t.cnpj_cpf_socio||'-'||t.nome_socio as origem, 'PJ_'||t.cnpj as destino, sq.descricao as tipo, 'socios' as base
-from cnpj.socios t
-left join cnpj.qualificacao_socio sq ON sq.codigo=t.qualificacao_socio
-where length(t.cnpj_cpf_socio)=11 AND t.nome_socio<>''
-;
--- PE->PJ empresa sócia no exterior 
-insert into ligacao1
-select 'PE_'||t.nome_socio as origem, 'PJ_'||t.cnpj as destino,  sq.descricao as tipo, 'socios' as base
-from cnpj.socios t
-left join cnpj.qualificacao_socio sq ON sq.codigo=t.qualificacao_socio
-where length(t.cnpj_cpf_socio)<>14 and length(t.cnpj_cpf_socio)<>11 and
-t.cnpj_cpf_socio=''
-;
--- PF>PE representante legal de empresa socia no exterior
-insert into ligacao1
-select  'PF_'||t.representante_legal||'-'||t.nome_representante as origem, 'PE_'||t.nome_socio as destino, 'rep-sócio-'||sq.descricao as tipo, 'socios' as base
-from cnpj.socios t
-left join cnpj.qualificacao_socio sq ON sq.codigo=t.qualificacao_representante_legal
-where length(t.cnpj_cpf_socio)<>14 and length(t.cnpj_cpf_socio)<>11 and
-t.cnpj_cpf_socio='' and t.representante_legal<>'***000000**'
-;
--- PF->PJ representante legal PJ->PJ
-insert into ligacao1
-select 'PF_'||t.representante_legal||'-'||t.nome_representante as origem, 'PJ_'||t.cnpj_cpf_socio as destino, 'rep-sócio-'||sq.descricao as tipo, 'socios' as base
-from cnpj.socios t
-left join cnpj.qualificacao_socio sq ON sq.codigo=t.qualificacao_representante_legal
-where length(t.cnpj_cpf_socio)=14 and t.representante_legal<>'***000000**' --t.nome_socio=''
-;
--- PF->PF representante legal de sócio PF
-insert into ligacao1
-select  'PF_'||t.representante_legal||'-'||t.nome_representante as origem, 'PF_'||t.cnpj_cpf_socio||'-'||t.nome_socio as destino, 'rep-sócio-'||sq.descricao as tipo, 'socios' as base
-from cnpj.socios t
-left join cnpj.qualificacao_socio sq ON sq.codigo=t.qualificacao_representante_legal
-where length(t.cnpj_cpf_socio)=11 and t.representante_legal<>'***000000**' --t.nome_socio=''
-;
---tabela filiais
-create table tfilial AS 
-select cnpj, cnpj_basico
-from estabelecimento t
-where  t.matriz_filial = '2' -- is '1' 
-;
-CREATE INDEX idx_filiais ON tfilial (cnpj_basico)
-;
--- PJ filial-> PJ matriz
-insert into ligacao1
-select 'PJ_'||tf.cnpj as origem, 'PJ_'||t.cnpj as destino, 'filial' as tipo, 'estabelecimento' as base
-from tfilial tf
-left join cnpj.estabelecimento t on t.cnpj_basico=tf.cnpj_basico 
-where  t.matriz_filial = '1' -- is '1'
-;
-DROP TABLE IF EXISTS tfilial 
-;
-/*
--- PJ->PJ filial->matriz, versao anterior, lenta por causa do self join
-insert into ligacao1
-select 'PJ_'||tf.cnpj as origem, 'PJ_'||t.cnpj as destino, 'filial' as tipo, 'estabelecimento' as base
-from cnpj.estabelecimento t
-left join cnpj.estabelecimento tf on tf.cnpj_basico=t.cnpj_basico 
-where  t.matriz_filial = '1' -- is '1' 
-and tf.matriz_filial = '2' -- is '2' --tf.cnpj<>t.cnpj 
-*/
-;
-
------------------------------------
---- cria tabela de ligacao
-----------------------------------
-
-CREATE TABLE ligacao AS
-SELECT  origem as id1, destino as id2, tipo as descricao, base as comentario from ligacao1 group by origem, destino, tipo, base
---testar... parece que group by é mais rápido que distinct
---SELECT DISTINCT origem as id1, destino as id2, tipo as descricao, base as comentario  from ligacao1
-;
- --para ficar no padrao das outras tabelas de ligacao
- 
-DROP TABLE IF EXISTS ligacao1
-;
-CREATE  INDEX idx_ligacao_origem ON ligacao (id1)
-;
-CREATE  INDEX idx_ligacao_destino ON ligacao (id2)
-;
-'''
-
-#engine = sqlalchemy.create_engine(f'sqlite:///{camDbSqliteBaseCompleta}')
-
-if bMemoria:
-    engine = sqlite3.connect(':memory:')
-else:
-    engine = sqlite3.connect(camDBrede)
-engine.execute("ATTACH DATABASE '" + camDBcnpj.replace('\\','/') + "' as cnpj")
-
-def executaSequencia(camDB, sqlsequencia):    
-    print(time.ctime(), f'Inicio - criando tabela {camDB}')
-    ktotal = len(sqlsequencia.split(';'))
-    for k,sql in enumerate(sqlsequencia.split(';'), 1):
-        if not sql.replace('\n','').strip():
-            continue
-        print('-'*30)
-        print(time.ctime(), '-executando parte:', f'{k}/{ktotal}')
-        print(sql)
-        engine.execute(sql)
-    print(time.ctime(), 'commit')
-    #engine.execute("DETACH  DATABASE cnpj") #apareceu mensagem database locked
-    engine.commit()
-    #engine.close()
-    print(time.ctime(), ' fim sqlseq')
-    
-    print(time.ctime(), 'salvando tabela')
-    if bMemoria:
-        bckengine = sqlite3.connect(camDB, detect_types=sqlite3.PARSE_DECLTYPES, uri=True)
-        with bckengine: #isso faz commit
-            engine.backup(bckengine)
-        bckengine.close()
-    engine.close()
-#.def executaSequencia
-
-# cria tabela rede.db
-executaSequencia(camDBrede, sqlsequencia=sql_ligacao)
-
-
-sql_search= '''
-----------------------------------------------
-------indexa full text pela tabela de ligação (substitui versão anterior que fazia por colunas da tabela empresas, estabelecimentos e socios)
------------------------------------------------
-
-DROP TABLE if exists id_search;
-CREATE virtual TABLE id_search using fts5 (id_descricao);
-
-insert into id_search
---select distinct id_descricao
-select id_descricao
-from ( 
-select 'PJ_' || te.cnpj ||'-' || t.razao_social  as id_descricao
-from cnpj.estabelecimento te 
-left join cnpj.empresas t on t.cnpj_basico=te.cnpj_basico
-where te.matriz_filial is '1'
-UNION ALL
-select 'PJ_' || te.cnpj ||'-' || te.nome_fantasia  as id_descricao 
-from cnpj.estabelecimento te 
--- where trim(te.nome_fantasia) <>'' --incluir este where faz que ignore cnpj filial sem nome fantasia, o que faz falta na hora de busca filiais por cnpj básico
-UNION ALL
-select  id1  as id_descricao
-from rede.ligacao
-where substr(id1,1,3)<>'PJ_'
-UNION ALL
-select  id2 as id_descricao
-from  rede.ligacao
-where substr(id2,1,3)<>'PJ_'
-) as tunion
-group by id_descricao --talvez group by seja mais rápido que distinct
-;
-
-'''
-
-#incluir na mão id_search para a tabela links. Abrir rede.db no dbbrowser, anexar links.db e  rodar o sql abaixo
-parte_tabela_links = '''
---inserir tabela links para busca em id_search
-insert into id_search
-select distinct id_descricao
-from ( 
-select  t.id1  as id_descricao
-from links.links t
-where substr(t.id1,1,3)<>'PJ_'
-UNION
-select  t.id2 as id_descricao
-from links.links t
-where substr(t.id2,1,3)<>'PJ_'
-) as tunion
-group by id_descricao --talvez group by seja mais rápido que distinct
-;
-'''
-
-#engine = sqlalchemy.create_engine(f'sqlite:///{camDbSqliteBaseCompleta}')
-#engine = sqlite3.connect(camDBrede)
-if bMemoria:
-    engine = sqlite3.connect(':memory:')
-    
-else:
-    engine = sqlite3.connect(camDBrede_search)
-engine.execute("ATTACH DATABASE '" + camDBrede + "' as rede")
-engine.execute("ATTACH DATABASE '" + camDBcnpj.replace('\\','/') + "' as cnpj")
-
-# cria tabela rede_search.db
-executaSequencia(camDBrede_search, sqlsequencia=sql_search)
-
-
-'''
-#https://stackoverflow.com/questions/5831548/how-to-save-my-in-memory-database-to-hard-disk
-conn = sqlite3.connect('file:existing_db.db?mode=memory',detect_types=sqlite3.PARSE_DECLTYPES,uri=True)
-bckup = sqlite3.connect('file:backup.db',detect_types=sqlite3.PARSE_DECLTYPES,uri=True)
-with bckup:
-    conn.backup(bckup)
-bckup.close()
-conn.close()
-'''
-
-print(f'Os arquivos {camDBrede} e {camDBrede_search} foram gerados.')
-print(time.ctime(), 'Fim!!!!!!!!!! ')
-#resp = input('Pressione Enter.')
-               

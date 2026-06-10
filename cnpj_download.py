@@ -152,7 +152,7 @@ def download_with_progress(urls):
         file_name = url.split('/')[-1]
 
         # Verifica se o arquivo da URL já existe na pasta ZIP_FOLDER
-        if not os.path.exists(f'.\{ZIP_FOLDER}\{file_name}'):
+        if not os.path.exists(os.path.join(ZIP_FOLDER, file_name)):
 
             print(f'Downloading file {i + 1} of {len(urls)}')
 
